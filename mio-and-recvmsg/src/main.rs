@@ -32,6 +32,7 @@ fn main() {
     let receiver = thread::spawn(move || -> std::io::Result<()> {
         let mut poll = mio::Poll::new()?;
         let udp = std::net::UdpSocket::bind("127.0.0.1:3456")?;
+        udp.set_nonblocking(true)?;
         let mut udp = mio::net::UdpSocket::from_std(udp);
         poll.registry().register(&mut udp, mio::Token(0), mio::Interest::READABLE)?;
         let mut events = mio::Events::with_capacity(128);
@@ -40,13 +41,20 @@ fn main() {
         loop {
             poll.poll(&mut events, None)?;
             for event in events.iter() {
-                match udp.recv_from(&mut buf) {
-                    Ok((len, from)) => {
-                        println!("len: {}, from: {}", len, from);
-                    }
-                    Err(e) => {
-                        println!("recv_from failed: {:?}", e);
-                        break;
+                if event.is_readable() {
+                    loop {
+                        match udp.recv_from(&mut buf) {
+                            Ok((len, from)) => {
+                                println!("len: {}, from: {}", len, from);
+                            }
+                            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                                break;
+                            }
+                            Err(e) => {
+                                println!("recv_from failed: {:?}", e);
+                                continue;
+                            }
+                        }    
                     }
                 }
             }
