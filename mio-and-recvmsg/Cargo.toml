@@ -1,0 +1,17 @@
+[package]
+name = "mio-and-recvmsg"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+libc = "0.2"
+mio = { version="0.8", features = ["net", "os-poll"] }
+os_socketaddr = "0.2.0"
+
+[target.'cfg(windows)'.dependencies]
+winapi = { version = "0.3", features = ["winuser"] }
+
+[build-dependencies]
+cc = "1.0"
