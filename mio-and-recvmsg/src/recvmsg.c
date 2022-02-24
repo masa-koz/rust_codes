@@ -70,7 +70,6 @@ __int64 recvmsg_for_quic(
                        &WSARecvMsg_GUID, sizeof WSARecvMsg_GUID,
                        &WSARecvMsg, sizeof WSARecvMsg,
                        &ncounter, NULL, NULL);
-    printf("nResult=%d\n", nResult);
     if (nResult == 0)
     {
         msg.name = src;
