@@ -2,4 +2,9 @@
 
 members = [
     "mio-and-recvmsg",
+    "mio-UdpDgram",
+    "mio-UnixStream",
+    "mio-UnixDgram",
+    "mio-UnixPipe",
+    "mio-TcpStream",
 ]
