@@ -7,4 +7,4 @@ edition = "2021"
 
 [dependencies]
 libc = "0.2"
-mio = { path = "../../mio", features = ["net", "os-poll"] }
+mio = { version = "0.8.1", features = ["net", "os-poll"] }
