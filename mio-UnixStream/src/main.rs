@@ -1,9 +1,9 @@
-use std::io::Write;
-use std::os::unix::io::AsRawFd;
-use std::thread;
-use std::time::Duration;
-
+#[cfg(unix)]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    use std::os::unix::io::AsRawFd;
+    use std::thread;
+    use std::time::Duration;
+
     let (mut stream1, mut stream2) = mio::net::UnixStream::pair()?;
 
     let receiver = thread::spawn(move || -> std::io::Result<()> {
@@ -32,7 +32,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             Ok(n) => {
                                 println!("read {:?} bytes", n);
                             }
-                            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => { break; }
+                            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                                break;
+                            }
                             Err(e) => {
                                 println!("failed: {:?}", e);
                             }
@@ -70,7 +72,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             Ok(n) => {
                                 println!("write {:?} bytes", n);
                             }
-                            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => { break; }
+                            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                                break;
+                            }
                             Err(e) => {
                                 println!("failed: {:?}", e);
                             }
@@ -87,4 +91,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let res = sender.join();
     println!("{:?}", res);
     Ok(())
+}
+
+#[cfg(windows)]
+fn main() {
+    println!("Not supported on Windows");
 }

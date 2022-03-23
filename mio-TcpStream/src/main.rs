@@ -1,7 +1,9 @@
-use std::io::Write;
-use std::os::unix::io::AsRawFd;
-use std::thread;
 use std::collections::HashMap;
+#[cfg(unix)]
+use std::os::unix::io::AsRawFd;
+#[cfg(windows)]
+use std::os::windows::io::AsRawSocket;
+use std::thread;
 use std::time::Duration;
 
 const SERVER: mio::Token = mio::Token(0);
@@ -22,27 +24,41 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             for event in events.iter() {
                 match event.token() {
                     SERVER => loop {
-                        let (mut conn, addr) = match listener.accept() {
-                            Ok((conn, addr)) => (conn, addr),
-                            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => { break; }
+                        let mut conn = match listener.accept() {
+                            Ok((conn, _)) => conn,
+                            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                                break;
+                            }
                             Err(e) => {
                                 return Err(e);
                             }
                         };
                         let token = next(&mut unique_token);
                         poll.registry()
-                        .register(&mut conn, token, mio::Interest::READABLE)?;
+                            .register(&mut conn, token, mio::Interest::READABLE)?;
                         connections.insert(token, conn);
-
-                    }
+                    },
                     token => {
                         let mut done = false;
                         if let Some(conn) = connections.get_mut(&token) {
                             loop {
                                 let res = conn.try_io(|| {
                                     let buf_ptr = &mut buf as *mut _ as *mut _;
-                                    let res =
-                                        unsafe { libc::recv(conn.as_raw_fd(), buf_ptr, buf.len(), 0) };
+                                    #[cfg(unix)]
+                                    let res = unsafe {
+                                        libc::recv(conn.as_raw_fd(), buf_ptr, buf.len(), 0)
+                                    };
+                                    #[cfg(windows)]
+                                    let res = unsafe {
+                                        libc::recvfrom(
+                                            conn.as_raw_socket() as usize,
+                                            buf_ptr,
+                                            buf.len() as i32,
+                                            0,
+                                            std::ptr::null_mut(),
+                                            std::ptr::null_mut(),
+                                        )
+                                    };
                                     if res != -1 {
                                         Ok(res as usize)
                                     } else {
@@ -57,7 +73,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         }
                                         println!("read {:?} bytes", n);
                                     }
-                                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => { break; }
+                                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                                        break;
+                                    }
                                     Err(e) => {
                                         return Err(e);
                                     }
@@ -66,7 +84,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                         if done {
                             if let Some(mut conn) = connections.remove(&token) {
-                                poll.registry().deregister(&mut conn);
+                                poll.registry().deregister(&mut conn).unwrap();
                             }
                         }
                     }
@@ -88,11 +106,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             for event in events.iter() {
                 if event.is_writable() {
                     loop {
-                        //let res = stream2.write(b"hello");
                         let res = stream.try_io(|| {
                             let buf_ptr = &buf as *const _ as *const _;
+                            #[cfg(unix)]
                             let res =
                                 unsafe { libc::send(stream.as_raw_fd(), buf_ptr, buf.len(), 0) };
+                            #[cfg(windows)]
+                            let res = unsafe {
+                                libc::sendto(
+                                    stream.as_raw_socket() as usize,
+                                    buf_ptr,
+                                    buf.len() as i32,
+                                    0,
+                                    std::ptr::null(),
+                                    0,
+                                )
+                            };
                             if res != -1 {
                                 Ok(res as usize)
                             } else {
@@ -103,7 +132,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             Ok(n) => {
                                 println!("write {:?} bytes", n);
                             }
-                            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => { break; }
+                            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                                break;
+                            }
                             Err(e) => {
                                 println!("failed: {:?}", e);
                             }
