@@ -7,4 +7,5 @@ members = [
     "mio-UnixDgram",
     "mio-UnixPipe",
     "mio-TcpStream",
+    "tokio-UdpDgram",
 ]
