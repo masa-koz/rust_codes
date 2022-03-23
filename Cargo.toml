@@ -8,4 +8,5 @@ members = [
     "mio-UnixPipe",
     "mio-TcpStream",
     "tokio-UdpDgram",
+    "multipath-Udp",
 ]
