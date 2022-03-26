@@ -52,23 +52,102 @@ fn main() -> std::io::Result<()> {
         return Ok(());
     };
 
-    let socket = std::net::UdpSocket::bind("0.0.0.0:0")?;
+    let socket = if addr.is_ipv4() {
+        std::net::UdpSocket::bind("0.0.0.0:0")?
+    } else {
+        std::net::UdpSocket::bind("[::]:0")?
+    };
 
     #[cfg(windows)]
     if matches.is_present("if_index") {
-        use std::os::windows::io::AsRawSocket;
-        use windows_sys::Win32::Networking::WinSock::{setsockopt, IPPROTO_IP, IP_UNICAST_IF};
         let if_index: u32 = matches.value_of_t("if_index").expect("validated");
-        let optval: [u32; 1] = [if_index.to_be(); 1];
-        let optlen: i32 = std::mem::size_of_val(&optval).try_into().unwrap();
-        unsafe {
-            setsockopt(
-                socket.as_raw_socket() as usize,
-                IPPROTO_IP as i32,
-                IP_UNICAST_IF as i32,
-                optval.as_ptr() as *const u8,
-                optlen,
-            );
+
+        use os_socketaddr::OsSocketAddr;
+        use windows_sys::Win32::Foundation::NO_ERROR;
+        use windows_sys::Win32::NetworkManagement::IpHelper::{
+            GetBestRoute2, IP_ADDRESS_PREFIX, MIB_IPFORWARD_ROW2, NET_LUID_LH,
+        };
+        use windows_sys::Win32::Networking::WinSock::{SOCKADDR_IN6, SOCKADDR_INET};
+
+        let destinationaddress: OsSocketAddr = addr.into();
+        let destinationaddress = destinationaddress.as_ptr() as *const _ as *const _;
+
+        let mut bestroute = MIB_IPFORWARD_ROW2 {
+            InterfaceLuid: NET_LUID_LH { Value: 0 },
+            InterfaceIndex: 0,
+            DestinationPrefix: IP_ADDRESS_PREFIX {
+                Prefix: SOCKADDR_INET { si_family: 0 },
+                PrefixLength: 0,
+            },
+            NextHop: SOCKADDR_INET { si_family: 0 },
+            SitePrefixLength: 0,
+            ValidLifetime: 0,
+            PreferredLifetime: 0,
+            Metric: 0,
+            Protocol: 0,
+            Loopback: 0,
+            AutoconfigureAddress: 0,
+            Publish: 0,
+            Immortal: 0,
+            Age: 0,
+            Origin: 0,
+        };
+        let mut bestsourceaddress = SOCKADDR_INET { si_family: 0 };
+
+        let res: u32 = unsafe {
+            GetBestRoute2(
+                std::ptr::null(),
+                if_index,
+                std::ptr::null(),
+                destinationaddress,
+                0,
+                &mut bestroute,
+                &mut bestsourceaddress,
+            ) as u32
+        };
+        if res != NO_ERROR {
+            eprintln!("No route to {} via IF {}", host, if_index);
+            return Ok(());
+        }
+        let nexthop = unsafe {
+            OsSocketAddr::from_raw_parts(
+                &bestroute.NextHop as *const _ as *const _,
+                std::mem::size_of::<SOCKADDR_IN6>(),
+            )
+        }
+        .into_addr();
+        println!("nexthop: {:?}", nexthop);
+
+        use std::os::windows::io::AsRawSocket;
+        use windows_sys::Win32::Networking::WinSock::{
+            setsockopt, IPPROTO_IP, IPPROTO_IPV6, IPV6_UNICAST_IF, IP_UNICAST_IF,
+        };
+
+        if addr.is_ipv4() {
+            let optval: [u32; 1] = [if_index.to_be(); 1];
+            let optlen: i32 = std::mem::size_of_val(&optval).try_into().unwrap();
+            unsafe {
+                setsockopt(
+                    socket.as_raw_socket() as usize,
+                    IPPROTO_IP as i32,
+                    IP_UNICAST_IF as i32,
+                    optval.as_ptr() as *const u8,
+                    optlen,
+                );
+            }
+        } else {
+            let optval: [u32; 1] = [if_index; 1];
+            let optlen: i32 = std::mem::size_of_val(&optval).try_into().unwrap();
+            unsafe {
+                setsockopt(
+                    socket.as_raw_socket() as usize,
+                    IPPROTO_IPV6 as i32,
+                    IPV6_UNICAST_IF as i32,
+                    optval.as_ptr() as *const u8,
+                    optlen,
+                );
+            }
+
         }
     }
     match socket.send_to(b"hello", addr) {
