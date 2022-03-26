@@ -156,7 +156,35 @@ fn main() -> std::io::Result<()> {
                     optlen,
                 );
             }
+        }
+    } else {
+        use os_socketaddr::OsSocketAddr;
+        use windows_sys::Win32::Foundation::NO_ERROR;
+        use windows_sys::Win32::NetworkManagement::IpHelper::{
+            FreeMibTable, GetUnicastIpAddressTable, AF_UNSPEC, MIB_UNICASTIPADDRESS_ROW,
+            MIB_UNICASTIPADDRESS_TABLE,
+        };
+        use windows_sys::Win32::Networking::WinSock::SOCKADDR_IN6;
 
+        unsafe {
+            let mut table: *mut MIB_UNICASTIPADDRESS_TABLE = std::ptr::null_mut();
+            let res = GetUnicastIpAddressTable(AF_UNSPEC as u16, &mut table) as u32;
+            if res == NO_ERROR {
+                println!("NumEntries: {}", (*table).NumEntries);
+                for i in 0..(*table).NumEntries as isize {
+                    let row = *(&(*table).Table[0] as *const MIB_UNICASTIPADDRESS_ROW).offset(i);
+                    println!("InterfaceIndex: {}", row.InterfaceIndex);
+                    let address = OsSocketAddr::from_raw_parts(
+                        &row.Address as *const _ as *const _,
+                        std::mem::size_of::<SOCKADDR_IN6>(),
+                    )
+                    .into_addr();
+                    println!("address: {:?}", address);
+                }
+            }
+            if !table.is_null() {
+                FreeMibTable(table as *const _);
+            }
         }
     }
     match socket.send_to(b"hello", addr) {
