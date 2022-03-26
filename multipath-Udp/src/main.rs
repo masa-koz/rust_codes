@@ -118,6 +118,15 @@ fn main() -> std::io::Result<()> {
         .into_addr();
         println!("nexthop: {:?}", nexthop);
 
+        let bestsourceaddress = unsafe {
+            OsSocketAddr::from_raw_parts(
+                &bestsourceaddress as *const _ as *const _,
+                std::mem::size_of::<SOCKADDR_IN6>(),
+            )
+        }
+        .into_addr();
+        println!("bestsourceaddress: {:?}", bestsourceaddress);
+
         use std::os::windows::io::AsRawSocket;
         use windows_sys::Win32::Networking::WinSock::{
             setsockopt, IPPROTO_IP, IPPROTO_IPV6, IPV6_UNICAST_IF, IP_UNICAST_IF,
