@@ -1,4 +1,5 @@
-use std::net::ToSocketAddrs;
+use std::collections::HashMap;
+use std::net::{SocketAddr, ToSocketAddrs};
 
 fn main() -> std::io::Result<()> {
     let app = clap::command!()
@@ -52,134 +53,37 @@ fn main() -> std::io::Result<()> {
         return Ok(());
     };
 
-    let socket = if addr.is_ipv4() {
-        std::net::UdpSocket::bind("0.0.0.0:0")?
-    } else {
-        std::net::UdpSocket::bind("[::]:0")?
-    };
+    let mut interfaces = HashMap::new();
 
     #[cfg(windows)]
     if matches.is_present("if_index") {
         let if_index: u32 = matches.value_of_t("if_index").expect("validated");
-
-        use os_socketaddr::OsSocketAddr;
-        use windows_sys::Win32::Foundation::NO_ERROR;
-        use windows_sys::Win32::NetworkManagement::IpHelper::{
-            GetBestRoute2, IP_ADDRESS_PREFIX, MIB_IPFORWARD_ROW2, NET_LUID_LH,
-        };
-        use windows_sys::Win32::Networking::WinSock::{SOCKADDR_IN6, SOCKADDR_INET};
-
-        let destinationaddress: OsSocketAddr = addr.into();
-        let destinationaddress = destinationaddress.as_ptr() as *const _ as *const _;
-
-        let mut bestroute = MIB_IPFORWARD_ROW2 {
-            InterfaceLuid: NET_LUID_LH { Value: 0 },
-            InterfaceIndex: 0,
-            DestinationPrefix: IP_ADDRESS_PREFIX {
-                Prefix: SOCKADDR_INET { si_family: 0 },
-                PrefixLength: 0,
-            },
-            NextHop: SOCKADDR_INET { si_family: 0 },
-            SitePrefixLength: 0,
-            ValidLifetime: 0,
-            PreferredLifetime: 0,
-            Metric: 0,
-            Protocol: 0,
-            Loopback: 0,
-            AutoconfigureAddress: 0,
-            Publish: 0,
-            Immortal: 0,
-            Age: 0,
-            Origin: 0,
-        };
-        let mut bestsourceaddress = SOCKADDR_INET { si_family: 0 };
-
-        let res: u32 = unsafe {
-            GetBestRoute2(
-                std::ptr::null(),
-                if_index,
-                std::ptr::null(),
-                destinationaddress,
-                0,
-                &mut bestroute,
-                &mut bestsourceaddress,
-            ) as u32
-        };
-        if res != NO_ERROR {
-            eprintln!("No route to {} via IF {}", host, if_index);
-            return Ok(());
-        }
-        let nexthop = unsafe {
-            OsSocketAddr::from_raw_parts(
-                &bestroute.NextHop as *const _ as *const _,
-                std::mem::size_of::<SOCKADDR_IN6>(),
-            )
-        }
-        .into_addr();
-        println!("nexthop: {:?}", nexthop);
-
-        let bestsourceaddress = unsafe {
-            OsSocketAddr::from_raw_parts(
-                &bestsourceaddress as *const _ as *const _,
-                std::mem::size_of::<SOCKADDR_IN6>(),
-            )
-        }
-        .into_addr();
-        println!("bestsourceaddress: {:?}", bestsourceaddress);
-
-        use std::os::windows::io::AsRawSocket;
-        use windows_sys::Win32::Networking::WinSock::{
-            setsockopt, IPPROTO_IP, IPPROTO_IPV6, IPV6_UNICAST_IF, IP_UNICAST_IF,
-        };
-
-        if addr.is_ipv4() {
-            let optval: [u32; 1] = [if_index.to_be(); 1];
-            let optlen: i32 = std::mem::size_of_val(&optval).try_into().unwrap();
-            unsafe {
-                setsockopt(
-                    socket.as_raw_socket() as usize,
-                    IPPROTO_IP as i32,
-                    IP_UNICAST_IF as i32,
-                    optval.as_ptr() as *const u8,
-                    optlen,
-                );
-            }
-        } else {
-            let optval: [u32; 1] = [if_index; 1];
-            let optlen: i32 = std::mem::size_of_val(&optval).try_into().unwrap();
-            unsafe {
-                setsockopt(
-                    socket.as_raw_socket() as usize,
-                    IPPROTO_IPV6 as i32,
-                    IPV6_UNICAST_IF as i32,
-                    optval.as_ptr() as *const u8,
-                    optlen,
-                );
-            }
-        }
+        interfaces.insert(if_index, ());
     } else {
-        use os_socketaddr::OsSocketAddr;
         use windows_sys::Win32::Foundation::NO_ERROR;
         use windows_sys::Win32::NetworkManagement::IpHelper::{
             FreeMibTable, GetUnicastIpAddressTable, AF_UNSPEC, MIB_UNICASTIPADDRESS_ROW,
             MIB_UNICASTIPADDRESS_TABLE,
         };
-        use windows_sys::Win32::Networking::WinSock::SOCKADDR_IN6;
-
         unsafe {
             let mut table: *mut MIB_UNICASTIPADDRESS_TABLE = std::ptr::null_mut();
             let res = GetUnicastIpAddressTable(AF_UNSPEC as u16, &mut table) as u32;
             if res == NO_ERROR {
-                println!("NumEntries: {}", (*table).NumEntries);
                 for i in 0..(*table).NumEntries as isize {
                     let row = *(&(*table).Table[0] as *const MIB_UNICASTIPADDRESS_ROW).offset(i);
-                    println!("InterfaceIndex: {}", row.InterfaceIndex);
+                    interfaces.insert(row.InterfaceIndex, ());
+                    /*
+                    use os_socketaddr::OsSocketAddr;
+                    use windows_sys::Win32::Networking::WinSock::SOCKADDR_IN6;
+
+                    eprintln!("InterfaceIndex: {}", row.InterfaceIndex);
                     let address = OsSocketAddr::from_raw_parts(
                         &row.Address as *const _ as *const _,
                         std::mem::size_of::<SOCKADDR_IN6>(),
                     )
                     .into_addr();
-                    println!("address: {:?}", address);
+                    eprintln!("address: {:?}", address);
+                    */
                 }
             }
             if !table.is_null() {
@@ -187,6 +91,31 @@ fn main() -> std::io::Result<()> {
             }
         }
     }
+
+    for if_index in interfaces.into_keys() {
+        match send_hello(addr, if_index) {
+            Ok(_) => {
+                eprintln!("Send \"hello\" to {:?} via IF {}", addr, if_index);
+            }
+            Err(e) => {
+                eprintln!(
+                    "Failed to send \"hello\" to {:?} via IF {}: {:?}",
+                    addr, if_index, e
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn send_hello(addr: SocketAddr, _if_index: u32) -> std::io::Result<()> {
+    let socket = if addr.is_ipv4() {
+        std::net::UdpSocket::bind("0.0.0.0:0")?
+    } else {
+        std::net::UdpSocket::bind("[::]:0")?
+    };
+
     match socket.send_to(b"hello", addr) {
         Ok(len) => {
             eprintln!("Send {} bytes to {:?}", len, addr);
@@ -196,4 +125,146 @@ fn main() -> std::io::Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(windows)]
+fn send_hello(addr: SocketAddr, if_index: u32) -> std::io::Result<usize> {
+    use os_socketaddr::OsSocketAddr;
+    use windows_sys::Win32::Foundation::NO_ERROR;
+    use windows_sys::Win32::NetworkManagement::IpHelper::{
+        GetBestRoute2, GetIpPathEntry, AF_UNSPEC, IP_ADDRESS_PREFIX, MIB_IPFORWARD_ROW2,
+        MIB_IPPATH_ROW, MIB_IPPATH_ROW_0, NET_LUID_LH,
+    };
+    use windows_sys::Win32::Networking::WinSock::SOCKADDR_INET;
+
+    let destinationaddress: OsSocketAddr = addr.into();
+    let destinationaddress = destinationaddress.as_ptr() as *const _ as *const _;
+
+    let mut bestroute = MIB_IPFORWARD_ROW2 {
+        InterfaceLuid: NET_LUID_LH { Value: 0 },
+        InterfaceIndex: 0,
+        DestinationPrefix: IP_ADDRESS_PREFIX {
+            Prefix: SOCKADDR_INET { si_family: 0 },
+            PrefixLength: 0,
+        },
+        NextHop: SOCKADDR_INET { si_family: 0 },
+        SitePrefixLength: 0,
+        ValidLifetime: 0,
+        PreferredLifetime: 0,
+        Metric: 0,
+        Protocol: 0,
+        Loopback: 0,
+        AutoconfigureAddress: 0,
+        Publish: 0,
+        Immortal: 0,
+        Age: 0,
+        Origin: 0,
+    };
+    let mut bestsourceaddress = SOCKADDR_INET { si_family: 0 };
+
+    let res = unsafe {
+        GetBestRoute2(
+            std::ptr::null(),
+            if_index,
+            std::ptr::null(),
+            destinationaddress,
+            0,
+            &mut bestroute,
+            &mut bestsourceaddress,
+        )
+    };
+    if res as u32 != NO_ERROR {
+        eprintln!("No route to {} via IF {}", addr, if_index);
+        return Err(std::io::Error::from_raw_os_error(res));
+    }
+    /*
+    use windows_sys::Win32::Networking::WinSock::SOCKADDR_IN6;
+    let nexthop = unsafe {
+        OsSocketAddr::from_raw_parts(
+            &bestroute.NextHop as *const _ as *const _,
+            std::mem::size_of::<SOCKADDR_IN6>(),
+        )
+    }
+    .into_addr();
+    eprintln!("nexthop: {:?}", nexthop);
+
+    let bestsourceaddress = unsafe {
+        OsSocketAddr::from_raw_parts(
+            &bestsourceaddress as *const _ as *const _,
+            std::mem::size_of::<SOCKADDR_IN6>(),
+        )
+    }
+    .into_addr();
+    eprintln!("bestsourceaddress: {:?}", bestsourceaddress);
+    */
+
+    let mut pathentry = MIB_IPPATH_ROW {
+        Source: SOCKADDR_INET {
+            si_family: AF_UNSPEC as u16,
+        },
+        Destination: SOCKADDR_INET {
+            si_family: AF_UNSPEC as u16,
+        },
+        InterfaceLuid: NET_LUID_LH { Value: 0 },
+        InterfaceIndex: 0,
+        CurrentNextHop: SOCKADDR_INET {
+            si_family: AF_UNSPEC as u16,
+        },
+        PathMtu: 0,
+        RttMean: 0,
+        RttDeviation: 0,
+        Anonymous: MIB_IPPATH_ROW_0 { LastReachable: 0 },
+        IsReachable: 0,
+        LinkTransmitSpeed: 0,
+        LinkReceiveSpeed: 0,
+    };
+    pathentry.Destination = unsafe { *destinationaddress };
+    pathentry.InterfaceIndex = if_index;
+
+    let res = unsafe { GetIpPathEntry(&mut pathentry) };
+    if res as u32 != NO_ERROR {
+        eprintln!("No entry of path to {} via IF {}", addr, if_index);
+        return Err(std::io::Error::from_raw_os_error(res));
+    }
+    eprintln!("IsReachable: {}", pathentry.IsReachable);
+    eprintln!("PathMtu: {}", pathentry.PathMtu);
+
+    let socket = if addr.is_ipv4() {
+        std::net::UdpSocket::bind("0.0.0.0:0")?
+    } else {
+        std::net::UdpSocket::bind("[::]:0")?
+    };
+
+    use std::os::windows::io::AsRawSocket;
+    use windows_sys::Win32::Networking::WinSock::{
+        setsockopt, IPPROTO_IP, IPPROTO_IPV6, IPV6_UNICAST_IF, IP_UNICAST_IF,
+    };
+
+    if addr.is_ipv4() {
+        let optval: [u32; 1] = [if_index.to_be(); 1];
+        let optlen: i32 = std::mem::size_of_val(&optval).try_into().unwrap();
+        unsafe {
+            setsockopt(
+                socket.as_raw_socket() as usize,
+                IPPROTO_IP as i32,
+                IP_UNICAST_IF as i32,
+                optval.as_ptr() as *const u8,
+                optlen,
+            );
+        }
+    } else {
+        let optval: [u32; 1] = [if_index; 1];
+        let optlen: i32 = std::mem::size_of_val(&optval).try_into().unwrap();
+        unsafe {
+            setsockopt(
+                socket.as_raw_socket() as usize,
+                IPPROTO_IPV6 as i32,
+                IPV6_UNICAST_IF as i32,
+                optval.as_ptr() as *const u8,
+                optlen,
+            );
+        }
+    }
+
+    socket.send_to(b"hello", addr)
 }
