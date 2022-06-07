@@ -7,7 +7,7 @@ edition = "2021"
 
 [dependencies]
 libc = "0.2"
-mio = { path = "../../mio_local", features = ["net", "os-poll"] }
+mio = { version = "0.8.3", features = ["net", "os-poll"] }
 os_socketaddr = "0.2.0"
 
 [target.'cfg(windows)'.dependencies]
