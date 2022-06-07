@@ -7,4 +7,4 @@ edition = "2021"
 
 [dependencies]
 libc  = "0.2"
-tokio = { path = "../../tokio/tokio", features = ["full", "tracing"] }
+tokio = { version = "1.19" , features = ["full", "tracing"] }

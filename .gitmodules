@@ -1,3 +1,0 @@
-[submodule "mio-and-recvmsg/mio"]
-	path = mio-and-recvmsg/mio
-	url = https://github.com/tokio-rs/mio.git
