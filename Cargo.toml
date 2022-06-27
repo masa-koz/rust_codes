@@ -9,4 +9,5 @@ members = [
     "mio-TcpStream",
     "tokio-UdpDgram",
     "multipath-Udp",
+    "transfer-fd",
 ]
