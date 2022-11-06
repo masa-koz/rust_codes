@@ -22,13 +22,13 @@ impl<'a> AsyncWrite for QuicSendStream {
         cx: &mut Context,
         buf: &[u8],
     ) -> Poll<std::io::Result<usize>> {
-        let key: usize = std::ptr::addr_of!(cx) as usize;
-        println!("key: {}", key);
-
         let me = self.get_mut();
 
+        let key: usize = std::ptr::addr_of!(cx) as usize;
         if !me.req_pending.contains_key(&key) {
-            let msg = Request::Write { buf: Bytes::new() };
+            let mut bytes_mut = BytesMut::new();
+            bytes_mut.extend_from_slice(buf);
+            let msg = Request::Write { buf: bytes_mut.freeze() };
             me.req_pending.insert(
                 key,
                 RequestState::State0 {
@@ -37,20 +37,24 @@ impl<'a> AsyncWrite for QuicSendStream {
             );
         }
     
-        match me.poll_generic(key, cx) {
+        let res = match me.poll_generic(key, cx) {
             Poll::Ready(Ok(Response::Write { written })) => {
-                return Poll::Ready(Ok(written));
+                Poll::Ready(Ok(written))
             }
             Poll::Ready(Ok(_)) => {
                 panic!("Invalid response!");
             }
             Poll::Ready(Err(e)) => {
-                return Poll::Ready(Err(std::io::Error::new(std::io::ErrorKind::Other, "oneshot recv failed")));
+                Poll::Ready(Err(std::io::Error::new(std::io::ErrorKind::Other, "oneshot recv failed")))
             }
             Poll::Pending => {
-                return Poll::Pending;
+                Poll::Pending
             },
+        };
+        if !res.is_pending() {
+            me.req_pending.remove(&key);
         }
+        res
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context) -> Poll<std::io::Result<()>> {
@@ -164,9 +168,10 @@ async fn main() {
                     let response = Response::Write { written: buf.len() };
                     let _ = respond_to.send(response);
                 }
-                None => {}
+                None => {
+                    break;
+                }
             }
-            break;
         }
     });
 
@@ -176,11 +181,16 @@ async fn main() {
         req_pending: HashMap::new(),
     };
 
-    let resp = poll_fn(move |cx| {
-        //fut.poll_unpin(cx)
-        Pin::new(&mut send_stream).poll_write(cx, b"")
+    let resp = poll_fn(|cx| {
+        Pin::new(&mut send_stream).poll_write(cx, b"1234")
     })
     .await;
     println!("Received response: {:?}", resp);
+    let resp = poll_fn(|cx| {
+        Pin::new(&mut send_stream).poll_write(cx, b"1234")
+    })
+    .await;
+    println!("Received response: {:?}", resp);
+    drop(send_stream);
     task.await;
 }
