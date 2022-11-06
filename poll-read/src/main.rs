@@ -2,77 +2,113 @@ use std::boxed::Box;
 use std::future::Future;
 use std::task::{Context, Poll};
 use std::pin::Pin;
+use std::collections::HashMap;
 
+use bytes::{Bytes, BytesMut};
 use futures::future::{poll_fn, FutureExt};
 use tokio::sync::{mpsc, oneshot};
+use tokio::io::AsyncWrite;
+
+struct QuicSendStream<'a> {
+    sender: mpsc::Sender<Request>,
+    stream_id: u64,
+    req_pending: HashMap<usize, RequestState<'a>>,
+}
+
+impl<'a> AsyncWrite for QuicSendStream<'a> {
+    fn poll_write(self: Pin<&mut Self>, cx: &mut Context, buf: &[u8]) -> Poll<std::io::Result<usize>> {
+        Poll::Ready(Ok(0))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context) -> Poll<std::io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+    
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context) -> Poll<std::io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
+pub type Error = Box<dyn std::error::Error + Send + Sync>;
+pub type Result<T> = std::result::Result<T, Error>;
 
 #[derive(Debug)]
-enum Message {
-    Read { respond_to: oneshot::Sender<i32> },
+enum Request {
+    Read { respond_to: oneshot::Sender<Response> },
+    Write { buf: Bytes, respond_to: oneshot::Sender<Response>}
 }
 
-struct RecvStream<'a> {
-    req_fut: Option<
-        Pin<
-            Box<dyn Future<Output = Result<(), tokio::sync::mpsc::error::SendError<Message>>> + 'a>,
-        >,
-    >,
+#[derive(Debug)]
+enum Response {
+    Read { buf: Bytes },
+    Write { written: usize },
 }
 
-enum ReadState<'a> {
+#[derive(Debug)]
+enum RequestError {
+    SendError(mpsc::error::SendError<Request>),
+    RecvError(oneshot::error::RecvError),
+}
+
+enum RequestState<'a> {
     State0 {
-        sender: &'a mpsc::Sender<Message>,
-        msg: Option<Message>,
-        recv: Option<&'a mut oneshot::Receiver<i32>>,
+        sender: &'a mpsc::Sender<Request>,
+        msg: Option<Request>,
+        recv: Option<&'a mut oneshot::Receiver<Response>>,
     },
     State1 {
-        fut: Pin<Box<dyn Future<Output = Result<(), tokio::sync::mpsc::error::SendError<Message>>> + 'a>>,
-        recv: Option<&'a mut oneshot::Receiver<i32>>,
+        fut: Pin<Box<dyn Future<Output = std::result::Result<(), tokio::sync::mpsc::error::SendError<Request>>> + 'a>>,
+        recv: Option<&'a mut oneshot::Receiver<Response>>,
     },
     State2 {
-        recv: Option<&'a mut oneshot::Receiver<i32>>,
+        recv: Option<&'a mut oneshot::Receiver<Response>>,
     },
     Terminated,
 }
 
-impl<'a> Future for ReadState<'a> {
-    type Output = ();
+impl<'a> Future for RequestState<'a> {
+    type Output = std::result::Result<Response, RequestError>;
 
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<()> {
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<std::result::Result<Response, RequestError>> {
         loop {
             match *self {
-                ReadState::State0 { sender, ref mut msg, ref mut recv} => {
+                RequestState::State0 { sender, ref mut msg, ref mut recv} => {
                     println!("State0");
                     let msg = msg.take().unwrap();
                     let recv = recv.take().unwrap();
-                    *self = ReadState::State1 { fut: Box::pin(sender.send(msg)), recv: Some(recv) };
+                    *self = RequestState::State1 { fut: Box::pin(sender.send(msg)), recv: Some(recv) };
                 }
-                ReadState::State1 { ref mut fut, ref mut recv } => {
+                RequestState::State1 { ref mut fut, ref mut recv } => {
                     println!("State1");
                     match fut.as_mut().poll(cx) {
-                        Poll::Ready(_) => {
+                        Poll::Ready(Ok(())) => {
                             let recv = recv.take().unwrap();
-                            *self = ReadState::State2 { recv: Some(recv)};
+                            *self = RequestState::State2 { recv: Some(recv)};
+                        }
+                        Poll::Ready(Err(e)) => {
+                            return Poll::Ready(Err(RequestError::SendError(e)));
                         }
                         Poll::Pending => {
                             return Poll::Pending;
                         }
                     }
                 }
-                ReadState::State2 { ref mut recv } => {
+                RequestState::State2 { ref mut recv } => {
                     println!("State2");
                     match recv.as_mut().unwrap().poll_unpin(cx) {
-                        Poll::Ready(a) => {
-                            println!("{:?}", a);
-                            *self = ReadState::Terminated;
-                            return Poll::Ready(());
+                        Poll::Ready(Ok(response)) => {
+                            *self = RequestState::Terminated;
+                            return Poll::Ready(Ok(response));
+                        }
+                        Poll::Ready(Err(e)) => {
+                            return Poll::Ready(Err(RequestError::RecvError(e)));
                         }
                         Poll::Pending => {
                             return Poll::Pending;
                         }
                     }
                 }
-                ReadState::Terminated => {
+                RequestState::Terminated => {
                     panic!("future polled after completion");
                 }
             }
@@ -86,9 +122,14 @@ async fn main() {
     let task = tokio::spawn(async move {
         loop {
             match receiver.recv().await {
-                Some(Message::Read { respond_to }) => {
-                    println!("Received request");
-                    let _ = respond_to.send(1);
+                Some(Request::Read { respond_to }) => {
+                    let buf = BytesMut::with_capacity(2048);
+                    let response = Response::Read {buf: buf.freeze()};
+                    let _ = respond_to.send(response);
+                }
+                Some(Request::Write { buf, respond_to }) => {
+                    let response = Response::Write { written:buf.len() };
+                    let _ = respond_to.send(response);
                 }
                 None => {
                 }
@@ -98,25 +139,13 @@ async fn main() {
     });
 
     let (send, mut recv) = oneshot::channel();
-    let msg = Message::Read { respond_to: send };
-    let mut fut = ReadState::State0 { sender: &sender, msg: Some(msg), recv: Some(&mut recv) };
+    let msg = Request::Read { respond_to: send };
+    let mut fut = RequestState::State0 { sender: &sender, msg: Some(msg), recv: Some(&mut recv) };
 
-    let _ = poll_fn(move |cx| {
+    let resp = poll_fn(move |cx| {
         fut.poll_unpin(cx)
-        /*        
-        let mut recv_stream = RecvStream { req_fut: None };
-        loop {
-            recv_stream.req_fut = Some(Box::pin(sender.send(msg)));
-            let res = if let Some(mut fut) = recv_stream.req_fut {
-                fut.as_mut().poll(cx)
-            } else {
-                Poll::Ready(Ok(()))
-            };
-        }
-        */
-        //let resp = recv.await.unwrap();
-        //println!("Received response: {}", resp);
     })
     .await;
+    println!("Received response: {:?}", resp);
     task.await;
 }
