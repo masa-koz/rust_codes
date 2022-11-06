@@ -1,11 +1,11 @@
 use std::boxed::Box;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::pin::Pin;
+use std::future::Future;
 use std::task::{Context, Poll};
 
 use bytes::{Bytes, BytesMut};
 use futures::future::{poll_fn, FutureExt};
-use futures::io::Read;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::{PollSendError, PollSender};
@@ -223,6 +223,54 @@ impl QuicSendStream {
     }
 }
 
+struct QuicReadDgram {
+    receiver: mpsc::Receiver<Response>,
+}
+
+impl QuicReadDgram {
+    async fn read_chunk(&mut self) -> std::result::Result<Bytes, ReadDgramError> {
+        ReadChunk {
+            read_dgram: self,
+        }.await
+    }
+
+    fn poll_read_chunk(&mut self, cx: &mut Context<'_>) -> Poll<std::result::Result<Bytes, ReadDgramError>> {
+        match self.receiver.poll_recv(cx) {
+            Poll::Ready(Some(Response::ReadDgram { bytes })) => {
+                return Poll::Ready(Ok(bytes));
+            }
+            Poll::Ready(None) => {
+                return Poll::Ready(Err(ReadDgramError::ConnectionClosed));
+            }
+            Poll::Ready(Some(_)) => {
+                panic!("Invalid response!");
+            }
+            Poll::Pending => {
+                return Poll::Pending;
+            }
+        }
+    }
+}
+
+struct ReadChunk<'a> {
+    read_dgram: &'a mut QuicReadDgram,
+}
+
+impl<'a> Future for ReadChunk<'a> {
+    type Output = std::result::Result<Bytes, ReadDgramError>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
+        let me = self.get_mut();
+
+        me.read_dgram.poll_read_chunk(cx)
+    }
+}
+
+#[derive(Debug)]
+enum ReadDgramError {
+    ConnectionClosed,
+}
+
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -236,6 +284,7 @@ enum Request {
 enum Response {
     Read { buf: Bytes },
     Write { written: usize },
+    ReadDgram { bytes: Bytes },
 }
 
 #[derive(Debug)]
@@ -256,7 +305,8 @@ enum RequestState {
 
 #[tokio::main]
 async fn main() {
-    let (sender, mut receiver) = mpsc::channel::<(Request, oneshot::Sender<Response>)>(1);
+    let (sender, mut receiver) = mpsc::channel::<(Request, oneshot::Sender<Response>)>(128);
+    let (dgram_writer, dgram_reader) = mpsc::channel(128);
 
     let task = tokio::spawn(async move {
         loop {
@@ -277,6 +327,15 @@ async fn main() {
                     break;
                 }
             }
+        }
+    });
+
+    let task1 = tokio::spawn(async move {
+        for _ in 0..2 {
+            let mut buf = BytesMut::with_capacity(1300);
+            buf.resize(1300, 0);
+            let resp = Response::ReadDgram { bytes: buf.freeze() };
+            let _ = dgram_writer.send(resp).await;
         }
     });
 
@@ -307,7 +366,20 @@ async fn main() {
     .await;
     println!("Received response: {:?}", resp);
     println!("{:?}", buf);
+
+    let mut read_dgram = QuicReadDgram {
+        receiver: dgram_reader,
+    };
+    let resp = poll_fn(|cx| {
+        read_dgram.poll_read_chunk(cx)
+    }).await;
+    println!("Received response: {:?}", resp);
+    let resp = read_dgram.read_chunk().await;
+    println!("Received response: {:?}", resp);
+
     drop(send_stream);
     drop(recv_stream);
+    drop(read_dgram);
     task.await;
+    task1.await;
 }
