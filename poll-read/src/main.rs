@@ -306,7 +306,7 @@ enum RequestState {
 #[tokio::main]
 async fn main() {
     let (sender, mut receiver) = mpsc::channel::<(Request, oneshot::Sender<Response>)>(128);
-    let (dgram_writer, dgram_reader) = mpsc::channel(128);
+    let (dgram_writer, dgram_reader) = mpsc::channel(1);
 
     let task = tokio::spawn(async move {
         loop {
@@ -331,11 +331,25 @@ async fn main() {
     });
 
     let task1 = tokio::spawn(async move {
-        for _ in 0..2 {
+        loop {
             let mut buf = BytesMut::with_capacity(1300);
             buf.resize(1300, 0);
             let resp = Response::ReadDgram { bytes: buf.freeze() };
-            let _ = dgram_writer.send(resp).await;
+            match dgram_writer.try_reserve() {
+                Ok(permit) => {
+                    permit.send(resp);
+                    println!("New datagram available!");
+                },
+                Err(mpsc::error::TrySendError::Full(Response)) => {
+                    println!("before sleep");
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                },
+                Err(mpsc::error::TrySendError::Closed(Response)) => {
+                    println!("shutdown");
+                    break;
+                },
+
+            }
         }
     });
 
@@ -373,9 +387,19 @@ async fn main() {
     let resp = poll_fn(|cx| {
         read_dgram.poll_read_chunk(cx)
     }).await;
-    println!("Received response: {:?}", resp);
+    if let Ok(bytes) = resp {
+        println!("Received response: bytes.len={}", bytes.len());
+    }
     let resp = read_dgram.read_chunk().await;
-    println!("Received response: {:?}", resp);
+    if let Ok(bytes) = resp {
+        println!("Received response: bytes.len={}", bytes.len());
+    }
+    let resp = read_dgram.read_chunk().await;
+    if let Ok(bytes) = resp {
+        println!("Received response: bytes.len={}", bytes.len());
+    } else {
+        println!("resp={:?}", resp);
+    }
 
     drop(send_stream);
     drop(recv_stream);
