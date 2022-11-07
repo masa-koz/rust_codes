@@ -426,4 +426,5 @@ async fn main() {
     drop(read_dgram);
     task.await;
     task1.await;
+    task2.await;
 }
