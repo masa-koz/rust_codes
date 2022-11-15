@@ -65,57 +65,6 @@ impl<'a> AsyncRead for QuicRecvStream {
     }
 }
 
-impl QuicRecvStream {
-    fn poll_generic(
-        &mut self,
-        key: usize,
-        cx: &mut Context,
-    ) -> Poll<std::result::Result<Response, RequestError>> {
-        loop {
-            match self.req_pending.get_mut(&key).unwrap() {
-                RequestState::State0 { ref mut msg } => {
-                    println!("State0");
-                    match self.sender.poll_reserve(cx) {
-                        Poll::Ready(Ok(())) => {
-                            let msg = msg.take().unwrap();
-                            let (send, mut recv) = oneshot::channel();
-                            if let Err(e) = self.sender.send_item((msg, send)) {
-                                return Poll::Ready(Err(RequestError::SendError(e)));
-                            }
-                            *self.req_pending.get_mut(&key).unwrap() =
-                                RequestState::State1 { recv: Some(recv) };
-                        }
-                        Poll::Ready(Err(e)) => {
-                            return Poll::Ready(Err(RequestError::SendError(e)));
-                        }
-                        Poll::Pending => {
-                            return Poll::Pending;
-                        }
-                    }
-                }
-                RequestState::State1 { ref mut recv } => {
-                    println!("State1");
-                    match recv.as_mut().unwrap().poll_unpin(cx) {
-                        Poll::Ready(Ok(response)) => {
-                            *self.req_pending.get_mut(&key).unwrap() = RequestState::Terminated;
-                            return Poll::Ready(Ok(response));
-                        }
-                        Poll::Ready(Err(e)) => {
-                            return Poll::Ready(Err(RequestError::RecvError(e)));
-                        }
-                        Poll::Pending => {
-                            return Poll::Pending;
-                        }
-                    }
-                }
-                RequestState::Terminated => {
-                    panic!("future polled after completion");
-                }
-            }
-        }
-    }
-}
-
 struct QuicSendStream {
     sender: PollSender<(Request, oneshot::Sender<Response>)>,
     stream_id: u64,
@@ -140,8 +89,9 @@ impl<'a> AsyncWrite for QuicSendStream {
             me.req_pending
                 .insert(key, RequestState::State0 { msg: Some(msg) });
         }
+        let state = me.req_pending.get_mut(&key).unwrap();
 
-        let res = match me.poll_generic(key, cx) {
+        let res = match poll_generic(&mut me.sender, state, cx) {
             Poll::Ready(Ok(Response::Write { written })) => Poll::Ready(Ok(written)),
             Poll::Ready(Ok(_)) => {
                 panic!("Invalid response!");
@@ -167,52 +117,46 @@ impl<'a> AsyncWrite for QuicSendStream {
     }
 }
 
-impl QuicSendStream {
-    fn poll_generic(
-        &mut self,
-        key: usize,
-        cx: &mut Context,
-    ) -> Poll<std::result::Result<Response, RequestError>> {
-        loop {
-            match self.req_pending.get_mut(&key).unwrap() {
-                RequestState::State0 { ref mut msg } => {
-                    println!("State0");
-                    match self.sender.poll_reserve(cx) {
-                        Poll::Ready(Ok(())) => {
-                            let msg = msg.take().unwrap();
-                            let (send, mut recv) = oneshot::channel();
-                            if let Err(e) = self.sender.send_item((msg, send)) {
-                                return Poll::Ready(Err(RequestError::SendError(e)));
-                            }
-                            *self.req_pending.get_mut(&key).unwrap() =
-                                RequestState::State1 { recv: Some(recv) };
+fn poll_generic(
+    sender: &mut PollSender<(Request, oneshot::Sender<Response>)>,
+    state: &mut RequestState,
+    cx: &mut Context,
+) -> Poll<std::result::Result<Response, RequestError>> {
+    loop {
+        match state {
+            RequestState::State0 { ref mut msg } => {
+                println!("State0");
+                match ready!(sender.poll_reserve(cx)) {
+                    Ok(()) => {
+                        if msg.is_none() {
+                            return Poll::Ready(Err(RequestError::NoRequest));
                         }
-                        Poll::Ready(Err(e)) => {
+                        let msg = msg.take().unwrap();
+                        let (send, mut recv) = oneshot::channel();
+                        if let Err(e) = sender.send_item((msg, send)) {
                             return Poll::Ready(Err(RequestError::SendError(e)));
                         }
-                        Poll::Pending => {
-                            return Poll::Pending;
-                        }
+                        *state = RequestState::State1 { recv: recv };
+                    }
+                    Err(e) => {
+                        return Poll::Ready(Err(RequestError::SendError(e)));
                     }
                 }
-                RequestState::State1 { ref mut recv } => {
-                    println!("State1");
-                    match recv.as_mut().unwrap().poll_unpin(cx) {
-                        Poll::Ready(Ok(response)) => {
-                            *self.req_pending.get_mut(&key).unwrap() = RequestState::Terminated;
-                            return Poll::Ready(Ok(response));
-                        }
-                        Poll::Ready(Err(e)) => {
-                            return Poll::Ready(Err(RequestError::RecvError(e)));
-                        }
-                        Poll::Pending => {
-                            return Poll::Pending;
-                        }
+            }
+            RequestState::State1 { ref mut recv } => {
+                println!("State1");
+                match ready!(recv.poll_unpin(cx)) {
+                    Ok(response) => {
+                        *state = RequestState::Terminated;
+                        return Poll::Ready(Ok(response));
+                    }
+                    Err(e) => {
+                        return Poll::Ready(Err(RequestError::RecvError(e)));
                     }
                 }
-                RequestState::Terminated => {
-                    panic!("future polled after completion");
-                }
+            }
+            RequestState::Terminated => {
+                panic!("future polled after completion");
             }
         }
     }
@@ -285,6 +229,7 @@ enum Response {
 
 #[derive(Debug)]
 enum RequestError {
+    NoRequest,
     SendError(PollSendError<(Request, oneshot::Sender<Response>)>),
     RecvError(oneshot::error::RecvError),
 }
@@ -294,7 +239,7 @@ enum RequestState {
         msg: Option<Request>,
     },
     State1 {
-        recv: Option<oneshot::Receiver<Response>>,
+        recv: oneshot::Receiver<Response>,
     },
     Terminated,
 }
