@@ -16,7 +16,7 @@ struct QuicRecvStream {
     local_storage: Option<Bytes>,
     sender: PollSender<(Request, oneshot::Sender<Response>)>,
     stream_id: u64,
-    req_pending: HashMap<usize, RequestState>,
+    cmd_pending: HashMap<usize, Command>,
 }
 
 impl<'a> AsyncRead for QuicRecvStream {
@@ -68,7 +68,7 @@ impl<'a> AsyncRead for QuicRecvStream {
 struct QuicSendStream {
     sender: PollSender<(Request, oneshot::Sender<Response>)>,
     stream_id: u64,
-    req_pending: HashMap<usize, RequestState>,
+    cmd_pending: HashMap<usize, Command>,
 }
 
 impl<'a> AsyncWrite for QuicSendStream {
@@ -80,18 +80,18 @@ impl<'a> AsyncWrite for QuicSendStream {
         let me = self.get_mut();
 
         let key: usize = std::ptr::addr_of!(cx) as usize;
-        if !me.req_pending.contains_key(&key) {
+        if !me.cmd_pending.contains_key(&key) {
             let mut bytes_mut = BytesMut::new();
             bytes_mut.extend_from_slice(buf);
             let msg = Request::Write {
                 buf: bytes_mut.freeze(),
             };
-            me.req_pending
-                .insert(key, RequestState::State0 { msg: Some(msg) });
+            me.cmd_pending
+                .insert(key, Command::State0 { msg: Some(msg) });
         }
-        let state = me.req_pending.get_mut(&key).unwrap();
+        let cmd = me.cmd_pending.get_mut(&key).unwrap();
 
-        let res = match poll_generic(&mut me.sender, state, cx) {
+        let res = match cmd.poll_execute(&mut me.sender, cx) {
             Poll::Ready(Ok(Response::Write { written })) => Poll::Ready(Ok(written)),
             Poll::Ready(Ok(_)) => {
                 panic!("Invalid response!");
@@ -103,7 +103,7 @@ impl<'a> AsyncWrite for QuicSendStream {
             Poll::Pending => Poll::Pending,
         };
         if !res.is_pending() {
-            me.req_pending.remove(&key);
+            me.cmd_pending.remove(&key);
         }
         res
     }
@@ -114,51 +114,6 @@ impl<'a> AsyncWrite for QuicSendStream {
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context) -> Poll<std::io::Result<()>> {
         Poll::Ready(Ok(()))
-    }
-}
-
-fn poll_generic(
-    sender: &mut PollSender<(Request, oneshot::Sender<Response>)>,
-    state: &mut RequestState,
-    cx: &mut Context,
-) -> Poll<std::result::Result<Response, RequestError>> {
-    loop {
-        match state {
-            RequestState::State0 { ref mut msg } => {
-                println!("State0");
-                match ready!(sender.poll_reserve(cx)) {
-                    Ok(()) => {
-                        if msg.is_none() {
-                            return Poll::Ready(Err(RequestError::NoRequest));
-                        }
-                        let msg = msg.take().unwrap();
-                        let (send, mut recv) = oneshot::channel();
-                        if let Err(e) = sender.send_item((msg, send)) {
-                            return Poll::Ready(Err(RequestError::SendError(e)));
-                        }
-                        *state = RequestState::State1 { recv: recv };
-                    }
-                    Err(e) => {
-                        return Poll::Ready(Err(RequestError::SendError(e)));
-                    }
-                }
-            }
-            RequestState::State1 { ref mut recv } => {
-                println!("State1");
-                match ready!(recv.poll_unpin(cx)) {
-                    Ok(response) => {
-                        *state = RequestState::Terminated;
-                        return Poll::Ready(Ok(response));
-                    }
-                    Err(e) => {
-                        return Poll::Ready(Err(RequestError::RecvError(e)));
-                    }
-                }
-            }
-            RequestState::Terminated => {
-                panic!("future polled after completion");
-            }
-        }
     }
 }
 
@@ -234,7 +189,7 @@ enum RequestError {
     RecvError(oneshot::error::RecvError),
 }
 
-enum RequestState {
+enum Command {
     State0 {
         msg: Option<Request>,
     },
@@ -242,6 +197,54 @@ enum RequestState {
         recv: oneshot::Receiver<Response>,
     },
     Terminated,
+}
+
+impl Command {
+    fn poll_execute(
+        &mut self,
+        sender: &mut PollSender<(Request, oneshot::Sender<Response>)>,
+        cx: &mut Context,
+    ) -> Poll<std::result::Result<Response, RequestError>> {
+        loop {
+            match self {
+                Command::State0 { ref mut msg } => {
+                    println!("State0");
+                    match ready!(sender.poll_reserve(cx)) {
+                        Ok(()) => {
+                            if msg.is_none() {
+                                return Poll::Ready(Err(RequestError::NoRequest));
+                            }
+                            let msg = msg.take().unwrap();
+                            let (send, mut recv) = oneshot::channel();
+                            if let Err(e) = sender.send_item((msg, send)) {
+                                return Poll::Ready(Err(RequestError::SendError(e)));
+                            }
+                            *self = Command::State1 { recv: recv };
+                        }
+                        Err(e) => {
+                            return Poll::Ready(Err(RequestError::SendError(e)));
+                        }
+                    }
+                }
+                Command::State1 { ref mut recv } => {
+                    println!("State1");
+                    match ready!(recv.poll_unpin(cx)) {
+                        Ok(response) => {
+                            *self = Command::Terminated;
+                            return Poll::Ready(Ok(response));
+                        }
+                        Err(e) => {
+                            return Poll::Ready(Err(RequestError::RecvError(e)));
+                        }
+                    }
+                }
+                Command::Terminated => {
+                    panic!("future polled after completion");
+                }
+            }
+        }
+    }
+    
 }
 
 #[tokio::main]
@@ -320,7 +323,7 @@ async fn main() {
     let mut send_stream = QuicSendStream {
         sender: PollSender::new(sender.clone()),
         stream_id: 0,
-        req_pending: HashMap::new(),
+        cmd_pending: HashMap::new(),
     };
 
     let resp = poll_fn(|cx| Pin::new(&mut send_stream).poll_write(cx, b"1234")).await;
@@ -331,7 +334,7 @@ async fn main() {
         local_storage: None,
         sender: PollSender::new(sender),
         stream_id: 0,
-        req_pending: HashMap::new(),
+        cmd_pending: HashMap::new(),
     };
     let mut buf = [0u8; 2048];
     let mut rbuf = ReadBuf::new(&mut buf);
