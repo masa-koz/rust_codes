@@ -3,16 +3,18 @@ use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
+use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
 use futures::future::{poll_fn, FutureExt};
+use futures::{SinkExt, Stream, StreamExt};
 use futures_util::ready;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::{PollSendError, PollSender};
 
 struct QuicRecvStream {
-    receiver: mpsc::Receiver<Response>,
+    receiver: mpsc::Receiver<Bytes>,
     local_storage: Option<Bytes>,
     sender: PollSender<(Request, oneshot::Sender<Response>)>,
     stream_id: u64,
@@ -47,15 +49,12 @@ impl<'a> AsyncRead for QuicRecvStream {
             }
 
             let bytes = match ready!(me.receiver.poll_recv(cx)) {
-                Some(Response::Read { buf: bytes }) => bytes,
+                Some(bytes) => bytes,
                 None => {
                     return Poll::Ready(Err(std::io::Error::new(
                         std::io::ErrorKind::Other,
                         "oneshot recv failed",
                     )));
-                }
-                Some(_) => {
-                    panic!("Invalid response!");
                 }
             };
             println!("arrived bytes's len={}", bytes.len());
@@ -117,8 +116,103 @@ impl<'a> AsyncWrite for QuicSendStream {
     }
 }
 
+struct QuicDgram {
+    write: QuicWriteDgram,
+    read: QuicReadDgram,
+}
+
+struct QuicWriteDgram {
+    cmd_sender: PollSender<(Request, oneshot::Sender<Response>)>,
+    cmd_pending: HashMap<usize, Command>,
+    write_sender: PollSender<Bytes>,
+}
+impl QuicWriteDgram {
+    fn poll_write_chunk(
+        &mut self,
+        cx: &mut Context<'_>,
+        buf: &Bytes,
+    ) -> Poll<std::result::Result<(), WriteDgramError>> {
+        match ready!(self.poll_ready(cx)) {
+            Ok(()) => {
+                if let Err(_) = self.write_sender.send_item(buf.clone()) {
+                    return Poll::Ready(Err(WriteDgramError::ConnectionClosed));
+                }
+                return Poll::Ready(Ok(()));
+            }
+            Err(e) => {
+                return Poll::Ready(Err(WriteDgramError::ConnectionClosed));
+            }
+        }
+    }
+
+    fn poll_ready(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<std::result::Result<(), WriteDgramError>> {
+        let key: usize = std::ptr::addr_of!(cx) as usize;
+
+        if !self.cmd_pending.contains_key(&key) {
+            if let Some(write_sender) = self.write_sender.get_ref() {
+                if write_sender.capacity() > 0 {
+                    self.cmd_pending.insert(key, Command::Terminated);
+                } else {
+                    let msg = Request::WriteDgramReady;
+                    self.cmd_pending
+                        .insert(key, Command::State0 { msg: Some(msg) });
+                }
+            } else {
+                return Poll::Ready(Err(WriteDgramError::ConnectionClosed));
+            }
+        }
+
+        let cmd = self.cmd_pending.get_mut(&key).unwrap();
+
+        if !cmd.is_terminated() {
+            match ready!(cmd.poll_execute(&mut self.cmd_sender, cx)) {
+                Ok(Response::WriteDgramReady) => {}
+                Ok(_) => {
+                    panic!("Invalid response!");
+                }
+                Err(e) => return Poll::Ready(Err(WriteDgramError::ConnectionClosed)),
+            }
+        }
+
+        let res = match ready!(self.write_sender.poll_reserve(cx)) {
+            Ok(()) => Poll::Ready(Ok(())),
+            Err(e) => Poll::Ready(Err(WriteDgramError::ConnectionClosed)),
+        };
+
+        self.cmd_pending.remove(&key);
+        res
+    }
+
+    fn poll_flush(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<std::result::Result<(), WriteDgramError>> {
+        let key: usize = std::ptr::addr_of!(cx) as usize;
+        if !self.cmd_pending.contains_key(&key) {
+            let msg = Request::WriteDgramFlush;
+            self.cmd_pending
+                .insert(key, Command::State0 { msg: Some(msg) });
+        }
+        let cmd = self.cmd_pending.get_mut(&key).unwrap();
+
+        let res = match ready!(cmd.poll_execute(&mut self.cmd_sender, cx)) {
+            Ok(Response::WriteDgramFlush) => Poll::Ready(Ok(())),
+            Ok(_) => {
+                panic!("Invalid response!");
+            }
+            Err(e) => Poll::Ready(Err(WriteDgramError::ConnectionClosed)),
+        };
+        self.cmd_pending.remove(&key);
+        res
+    }
+}
+
 struct QuicReadDgram {
-    receiver: mpsc::Receiver<Response>,
+    req_sender: PollSender<(Request, oneshot::Sender<Response>)>,
+    read_receiver: mpsc::Receiver<Bytes>,
 }
 
 impl QuicReadDgram {
@@ -130,8 +224,8 @@ impl QuicReadDgram {
         &mut self,
         cx: &mut Context<'_>,
     ) -> Poll<std::result::Result<Bytes, ReadDgramError>> {
-        match self.receiver.poll_recv(cx) {
-            Poll::Ready(Some(Response::ReadDgram { bytes })) => {
+        match self.read_receiver.poll_recv(cx) {
+            Poll::Ready(Some(bytes)) => {
                 return Poll::Ready(Ok(bytes));
             }
             Poll::Ready(None) => {
@@ -144,6 +238,16 @@ impl QuicReadDgram {
                 return Poll::Pending;
             }
         }
+    }
+}
+
+impl Stream for QuicReadDgram {
+    type Item = std::result::Result<Bytes, ReadDgramError>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let me = self.get_mut();
+
+        Poll::Ready(Some(ready!(me.poll_read_chunk(cx))))
     }
 }
 
@@ -162,6 +266,11 @@ impl<'a> Future for ReadChunk<'a> {
 }
 
 #[derive(Debug)]
+enum WriteDgramError {
+    ConnectionClosed,
+}
+
+#[derive(Debug)]
 enum ReadDgramError {
     ConnectionClosed,
 }
@@ -173,6 +282,8 @@ pub type Result<T> = std::result::Result<T, Error>;
 enum Request {
     Read { len: usize },
     Write { buf: Bytes },
+    WriteDgramFlush,
+    WriteDgramReady,
 }
 
 #[derive(Debug)]
@@ -180,6 +291,8 @@ enum Response {
     Read { buf: Bytes },
     Write { written: usize },
     ReadDgram { bytes: Bytes },
+    WriteDgramFlush,
+    WriteDgramReady,
 }
 
 #[derive(Debug)]
@@ -190,12 +303,8 @@ enum RequestError {
 }
 
 enum Command {
-    State0 {
-        msg: Option<Request>,
-    },
-    State1 {
-        recv: oneshot::Receiver<Response>,
-    },
+    State0 { msg: Option<Request> },
+    State1 { recv: oneshot::Receiver<Response> },
     Terminated,
 }
 
@@ -244,80 +353,145 @@ impl Command {
             }
         }
     }
-    
+
+    fn is_terminated(&self) -> bool {
+        if let Command::Terminated = self {
+            true
+        } else {
+            false
+        }
+    }
 }
 
 #[tokio::main]
 async fn main() {
     let (sender, mut receiver) = mpsc::channel::<(Request, oneshot::Sender<Response>)>(128);
+    let (dgram_read_sender, dgram_read_reciver) = mpsc::channel(1);
+    let (dgram_write_sender, mut dgram_write_receiver) = mpsc::channel::<Bytes>(1);
+    let (stream_read_sender, stream_read_receiver) = mpsc::channel(1);
+
     let task = tokio::spawn(async move {
-        loop {
-            match receiver.recv().await {
-                Some((Request::Read { len }, respond_to)) => {
-                    println!("Received a Read request: len={}", len);
-                    let mut buf = BytesMut::with_capacity(len);
-                    buf.resize(len - 1, 0);
-                    let response = Response::Read { buf: buf.freeze() };
-                    let _ = respond_to.send(response);
+        let mut write_dgrams = VecDeque::new();
+        let mut sent_dgrams: VecDeque<Bytes> = VecDeque::new();
+        let mut write_dgram_waiting: Option<Bytes> = None;
+        let mut write_dgrams_flush_notifiers = Vec::new();
+        let mut write_dgrams_ready_notifiers = Vec::new();
+        let mut cwnd = 10000;
+        const MAX_SEND_DGRAMS: usize = 2;
+        'outer: loop {
+            tokio::select! {
+                res = receiver.recv() => {
+                    match res {
+                        Some((Request::Read { len }, respond_to)) => {
+                            println!("Received a Read request: len={}", len);
+                            let mut buf = BytesMut::with_capacity(len);
+                            buf.resize(len - 1, 0);
+                            let response = Response::Read { buf: buf.freeze() };
+                            let _ = respond_to.send(response);
+                        }
+                        Some((Request::Write { buf }, respond_to)) => {
+                            println!("Received a Write request: bytes={:?}", buf);
+                            let response = Response::Write { written: buf.len() };
+                            let _ = respond_to.send(response);
+                        }
+                        Some((Request::WriteDgramReady, respond_to)) => {
+                            println!("Received a Ready request");
+                            write_dgrams_ready_notifiers.push(respond_to);
+                        }
+                        Some((Request::WriteDgramFlush, respond_to)) => {
+                            println!("Received a Flush request");
+                            write_dgrams_flush_notifiers.push(respond_to);
+                        }
+                        None => {
+                            break 'outer;
+                        }
+                    }
+                },
+                _ = tokio::time::sleep(Duration::from_secs(1)) => {
+                    // Emulation of receiving QUIC packet
+                    println!("Wake up");
+                    if let Some(buf) = sent_dgrams.pop_front() {
+                        cwnd += buf.len();
+                    }
                 }
-                Some((Request::Write { buf }, respond_to)) => {
-                    println!("Received a Write request: bytes={:?}", buf);
-                    let response = Response::Write { written: buf.len() };
-                    let _ = respond_to.send(response);
-                }
-                None => {
-                    break;
-                }
-            }
-        }
-    });
-
-    let (dgram_writer, dgram_reader) = mpsc::channel(1);
-    let task1 = tokio::spawn(async move {
-        loop {
-            let mut buf = BytesMut::with_capacity(1300);
-            buf.resize(1300, 0);
-            let resp = Response::ReadDgram {
-                bytes: buf.freeze(),
             };
-            match dgram_writer.try_reserve() {
-                Ok(permit) => {
-                    permit.send(resp);
-                    println!("New datagram available!");
-                }
-                Err(mpsc::error::TrySendError::Full(Response)) => {
-                    println!("before sleep");
-                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                }
-                Err(mpsc::error::TrySendError::Closed(Response)) => {
-                    println!("shutdown");
-                    break;
+
+            if write_dgrams.len() < MAX_SEND_DGRAMS {
+                if let Some(buf) = write_dgram_waiting.take() {
+                    println!("Send Dgram#1: {} bytes", buf.len());
+                    write_dgrams.push_back(buf);
                 }
             }
-        }
-    });
+            if write_dgram_waiting.is_none() {
+                loop {
+                    match dgram_write_receiver.try_recv() {
+                        Ok(buf) => {
+                            while !write_dgrams_ready_notifiers.is_empty() {
+                                let respond_to = write_dgrams_ready_notifiers.pop().unwrap();
+                                let response = Response::WriteDgramReady;
+                                let _ = respond_to.send(response);
+                            }
+                            if write_dgrams.len() < MAX_SEND_DGRAMS {
+                                println!("Send Dgram#2: {} bytes", buf.len());
+                                write_dgrams.push_back(buf);
+                            } else {
+                                write_dgram_waiting = Some(buf);
+                                break;
+                            }
+                        }
+                        Err(
+                            mpsc::error::TryRecvError::Empty
+                            | mpsc::error::TryRecvError::Disconnected,
+                        ) => {
+                            while !write_dgrams_flush_notifiers.is_empty() {
+                                let respond_to = write_dgrams_flush_notifiers.pop().unwrap();
+                                let response = Response::WriteDgramFlush;
+                                let _ = respond_to.send(response);
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
 
-    let (stream_writer, stream_reader) = mpsc::channel(1);
-    let task2 = tokio::spawn(async move {
-        loop {
-            let mut buf = BytesMut::with_capacity(1300);
-            buf.resize(1300, 0);
-            let resp = Response::Read { buf: buf.freeze() };
-            match stream_writer.try_reserve() {
+            match stream_read_sender.try_reserve() {
                 Ok(permit) => {
-                    permit.send(resp);
+                    let mut buf = BytesMut::with_capacity(1300);
+                    buf.resize(1300, 0);
+
+                    permit.send(buf.freeze());
                     println!("New stream data available!");
                 }
-                Err(mpsc::error::TrySendError::Full(Response)) => {
-                    println!("before sleep");
-                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                }
-                Err(mpsc::error::TrySendError::Closed(Response)) => {
-                    println!("shutdown");
-                    break;
+                Err(mpsc::error::TrySendError::Full(_)) => {}
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    break 'outer;
                 }
             }
+            match dgram_read_sender.try_reserve() {
+                Ok(permit) => {
+                    let mut buf = BytesMut::with_capacity(1300);
+                    buf.resize(1300, 0);
+
+                    permit.send(buf.freeze());
+                    println!("New datagram available!");
+                }
+                Err(mpsc::error::TrySendError::Full(_)) => {}
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    break 'outer;
+                }
+            }
+
+            // Emulation of sending QUIC packet.
+            while !write_dgrams.is_empty()
+                && write_dgrams.front().map(|v| v.len()).unwrap_or(0) <= cwnd
+            {
+                let buf = write_dgrams.pop_front().unwrap();
+                cwnd -= buf.len();
+                sent_dgrams.push_back(buf);
+            }
+            
         }
+        println!("shutdown");
     });
 
     let mut send_stream = QuicSendStream {
@@ -330,9 +504,9 @@ async fn main() {
     println!("Received response: {:?}", resp);
 
     let mut recv_stream = QuicRecvStream {
-        receiver: stream_reader,
+        receiver: stream_read_receiver,
         local_storage: None,
-        sender: PollSender::new(sender),
+        sender: PollSender::new(sender.clone()),
         stream_id: 0,
         cmd_pending: HashMap::new(),
     };
@@ -345,14 +519,15 @@ async fn main() {
     println!("{:?}", rbuf);
 
     let mut rbuf = ReadBuf::new(&mut buf);
-    rbuf.advance(2048-652);
+    rbuf.advance(2048 - 652);
 
     let resp = poll_fn(|cx| Pin::new(&mut recv_stream).poll_read(cx, &mut rbuf)).await;
     println!("Received response: {:?}", resp);
     println!("{:?}", rbuf);
 
     let mut read_dgram = QuicReadDgram {
-        receiver: dgram_reader,
+        req_sender: PollSender::new(sender.clone()),
+        read_receiver: dgram_read_reciver,
     };
     let resp = poll_fn(|cx| read_dgram.poll_read_chunk(cx)).await;
     if let Ok(bytes) = resp {
@@ -362,17 +537,51 @@ async fn main() {
     if let Ok(bytes) = resp {
         println!("Received response: bytes.len={}", bytes.len());
     }
-    let resp = read_dgram.read_chunk().await;
-    if let Ok(bytes) = resp {
+    let resp = read_dgram.next().await;
+    if let Some(Ok(bytes)) = resp {
         println!("Received response: bytes.len={}", bytes.len());
     } else {
         println!("resp={:?}", resp);
     }
 
+    let mut write_dgram = QuicWriteDgram {
+        cmd_sender: PollSender::new(sender),
+        cmd_pending: HashMap::new(),
+        write_sender: PollSender::new(dgram_write_sender),
+    };
+
+    let mut buf = BytesMut::with_capacity(1300);
+    buf.resize(1300, 0);
+    let buf = buf.freeze();
+    let resp = poll_fn(|cx| write_dgram.poll_write_chunk(cx, &buf)).await;
+    if let Ok(()) = resp {
+        println!("Write Dgram: {} bytes", buf.len());
+    } else {
+        println!("resp={:?}", resp);
+    }
+
+    let resp = poll_fn(|cx| write_dgram.poll_write_chunk(cx, &buf)).await;
+    if let Ok(()) = resp {
+        println!("Write Dgram: {} bytes", buf.len());
+    } else {
+        println!("resp={:?}", resp);
+    }
+
+    let resp = poll_fn(|cx| write_dgram.poll_write_chunk(cx, &buf)).await;
+    if let Ok(()) = resp {
+        println!("Write Dgram: {} bytes", buf.len());
+    } else {
+        println!("resp={:?}", resp);
+    }
+
+    let resp = poll_fn(|cx| write_dgram.poll_flush(cx)).await;
+    if let Ok(()) = resp {
+        println!("Flush Dgram");
+    } else {
+        println!("resp={:?}", resp);
+    }
     drop(send_stream);
     drop(recv_stream);
     drop(read_dgram);
-    task.await;
-    task1.await;
-    task2.await;
+    let _ = task.await;
 }
