@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
 use futures::future::{poll_fn, FutureExt};
-use futures::{SinkExt, Stream, StreamExt};
+use futures::{SinkExt, Stream, StreamExt, Sink};
 use futures_util::ready;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::{mpsc, oneshot};
@@ -126,6 +126,7 @@ struct QuicWriteDgram {
     cmd_pending: HashMap<usize, Command>,
     write_sender: PollSender<Bytes>,
 }
+
 impl QuicWriteDgram {
     fn poll_write_chunk(
         &mut self,
@@ -207,6 +208,62 @@ impl QuicWriteDgram {
         };
         self.cmd_pending.remove(&key);
         res
+    }
+
+    fn poll_close(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<std::result::Result<(), WriteDgramError>> {
+        if !self.cmd_sender.is_closed() {
+            self.cmd_sender.close();
+        }
+
+        match ready!(self.poll_ready(cx)) {
+            Ok(()) => Poll::Ready(Ok(())),
+            Err(_) => Poll::Ready(Err(WriteDgramError::ConnectionClosed)),
+        }
+    }
+}
+
+impl Sink<Bytes> for QuicWriteDgram {
+    type Error = WriteDgramError;
+
+    fn poll_ready(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>
+    ) -> Poll<std::result::Result<(), Self::Error>> {
+        let me = self.get_mut();
+
+        me.poll_ready(cx)
+    }
+
+    fn start_send(self: Pin<&mut Self>, item: Bytes) -> std::result::Result<(), Self::Error> {
+        let me = self.get_mut();
+
+        if let Err(_) = me.write_sender.send_item(item) {
+            return Err(WriteDgramError::ConnectionClosed);
+        }
+        Ok(())
+    }
+
+    fn poll_flush(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>
+    ) -> Poll<std::result::Result<(), Self::Error>> {
+        let me = self.get_mut();
+
+        me.poll_flush(cx)
+
+    }
+
+    fn poll_close(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>
+    ) -> Poll<std::result::Result<(), Self::Error>> {
+        let me = self.get_mut();
+
+        me.poll_close(cx)
+
     }
 }
 
@@ -567,9 +624,9 @@ async fn main() {
         println!("resp={:?}", resp);
     }
 
-    let resp = poll_fn(|cx| write_dgram.poll_write_chunk(cx, &buf)).await;
+    let resp = write_dgram.send(buf.clone()).await;
     if let Ok(()) = resp {
-        println!("Write Dgram: {} bytes", buf.len());
+        println!("Write Dgram using SinkExit::send: {} bytes", buf.len());
     } else {
         println!("resp={:?}", resp);
     }
