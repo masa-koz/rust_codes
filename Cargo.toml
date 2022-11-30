@@ -11,4 +11,5 @@ members = [
     "multipath-Udp",
     "transfer-fd",
     "poll-read",
+    "embedded-tls-efi",
 ]
