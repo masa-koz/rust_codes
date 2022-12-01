@@ -12,4 +12,5 @@ members = [
     "transfer-fd",
     "poll-read",
     "show-profiles",
+    "embedded-tls-efi",
 ]
