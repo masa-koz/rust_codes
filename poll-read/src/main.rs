@@ -126,6 +126,7 @@ struct QuicWriteDgram {
     cmd_pending: HashMap<usize, Command>,
     write_sender: PollSender<Bytes>,
 }
+
 impl QuicWriteDgram {
     fn poll_write_chunk(
         &mut self,
@@ -208,6 +209,19 @@ impl QuicWriteDgram {
         self.cmd_pending.remove(&key);
         res
     }
+
+    fn poll_close(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<std::result::Result<(), WriteDgramError>> {
+        let res = ready!(self.poll_flush(cx));
+        if res.is_err() {
+            return Poll::Ready(res);
+        }
+        self.write_sender.close();
+        Poll::Ready(Ok(()))
+    }
+
 }
 
 struct QuicReadDgram {
