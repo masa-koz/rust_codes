@@ -1,0 +1,16 @@
+[package]
+name = "show-profiles"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+
+[target.'cfg(windows)'.dependencies.tokio]
+version = "1.20"
+features = ["full"]
+
+[target.'cfg(windows)'.dependencies.windows]
+version = "0.43.0"
+features = ["Foundation", "Foundation_Collections", "Networking_Connectivity"]
